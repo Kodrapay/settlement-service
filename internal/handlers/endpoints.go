@@ -24,6 +24,9 @@ func (h *SettlementHandler) CreateRun(c *fiber.Ctx) error {
 }
 
 func (h *SettlementHandler) Get(c *fiber.Ctx) error {
-	id := c.Params("id")
+	id, err := c.ParamsInt("id")
+	if err != nil {
+		return fiber.NewError(fiber.StatusBadRequest, "Invalid settlement ID")
+	}
 	return c.JSON(h.svc.Get(c.Context(), id))
 }

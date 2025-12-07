@@ -1,11 +1,15 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/kodra-pay/settlement-service/internal/services"
@@ -14,16 +18,17 @@ import (
 )
 
 type SettlementScheduler struct {
-	db               *sql.DB
-	redis            *redis.Client
-	settlementSvc    *services.SettlementService
-	ticker           *time.Ticker
-	stopChan         chan bool
-	checkIntervalMin int
-	delayMinutes     int
+	db                 *sql.DB
+	redis              *redis.Client
+	settlementSvc      *services.SettlementService
+	ticker             *time.Ticker
+	stopChan           chan bool
+	checkIntervalMin   int
+	delayMinutes       int
+	merchantServiceURL string
 }
 
-func NewSettlementScheduler(db *sql.DB, settlementSvc *services.SettlementService) *SettlementScheduler {
+func NewSettlementScheduler(db *sql.DB, settlementSvc *services.SettlementService, merchantServiceURL string) *SettlementScheduler {
 	// Initialize Redis client
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
@@ -50,12 +55,13 @@ func NewSettlementScheduler(db *sql.DB, settlementSvc *services.SettlementServic
 	}
 
 	return &SettlementScheduler{
-		db:               db,
-		redis:            redisClient,
-		settlementSvc:    settlementSvc,
-		checkIntervalMin: 1, // Check every minute for the demo
-		delayMinutes:     5, // T+1 simulated as 5 minutes for demo
-		stopChan:         make(chan bool),
+		db:                 db,
+		redis:              redisClient,
+		settlementSvc:      settlementSvc,
+		checkIntervalMin:   1, // Check every minute for the demo
+		delayMinutes:       5, // T+1 simulated as 5 minutes for demo
+		stopChan:           make(chan bool),
+		merchantServiceURL: merchantServiceURL,
 	}
 }
 
@@ -289,39 +295,41 @@ func (s *SettlementScheduler) hasSettledToday(ctx context.Context, merchantID st
 }
 
 // getAvailableBalance calculates the merchant's available balance for settlement
-func (s *SettlementScheduler) getAvailableBalance(ctx context.Context, merchantID string, cutoffDate time.Time) (int64, error) {
-	query := `
-		SELECT COALESCE(SUM(CASE
-			WHEN entry_type = 'credit' THEN amount
-			WHEN entry_type = 'debit' THEN -amount
-			ELSE 0
-		END), 0) as balance
-		FROM wallet_ledger
-		WHERE merchant_id = $1
-		  AND created_at <= $2
-	`
-
-	var balance int64
-	err := s.db.QueryRowContext(ctx, query, merchantID, cutoffDate).Scan(&balance)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get available balance: %w", err)
+func (s *SettlementScheduler) getAvailableBalance(ctx context.Context, merchantID int, cutoffDate time.Time) (int64, error) {
+	log.Printf("Getting available balance for merchant %d", merchantID)
+	if s.merchantServiceURL == "" {
+		return 0, fmt.Errorf("merchant service URL not configured")
 	}
 
-	// Subtract any pending settlements
-	pendingQuery := `
-		SELECT COALESCE(SUM(amount), 0)
-		FROM settlements
-		WHERE merchant_id = $1
-		  AND status IN ('pending', 'processing')
-	`
-
-	var pending int64
-	err = s.db.QueryRowContext(ctx, pendingQuery, merchantID).Scan(&pending)
+	url := fmt.Sprintf("%s/merchants/%d/balance", strings.TrimRight(s.merchantServiceURL, "/"), merchantID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return 0, fmt.Errorf("failed to get pending settlements: %w", err)
+		return 0, fmt.Errorf("failed to create request to merchant service: %w", err)
 	}
 
-	return balance - pending, nil
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get balance from merchant service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("merchant service returned status %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		AvailableBalance int64 `json:"available_balance"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return 0, fmt.Errorf("failed to decode balance response from merchant service: %w", err)
+	}
+
+	log.Printf("Available balance for merchant %d is %d kobo", merchantID, payload.AvailableBalance)
+
+	// The user's clarification is that the settlement should be for the money
+	// that is available in the account. The available_balance from the merchant-service
+	// should already be calculated correctly.
+	return payload.AvailableBalance, nil
 }
 
 // getBankAccount retrieves the merchant's primary bank account
@@ -406,8 +414,40 @@ func (s *SettlementScheduler) createSettlement(
 		    updated_at = NOW()
 		WHERE id = $1
 	`, settlementID); err != nil {
-		return settlementID, fmt.Errorf("failed to complete settlement %s: %w", settlementID, err)
+		return "", fmt.Errorf("failed to complete settlement %s: %w", settlementID, err) // Return error here
 	}
 
+	// Move funds from pending to available in merchant-service
+	go s.settleMerchantBalance(context.Background(), merchantID, currency, amount, settlementID)
+
 	return settlementID, nil
+}
+
+func (s *SettlementScheduler) settleMerchantBalance(ctx context.Context, merchantID, currency string, amount int64, settlementID string) {
+	if s.merchantServiceURL == "" {
+		return
+	}
+	url := fmt.Sprintf("%s/internal/balance/settle", strings.TrimRight(s.merchantServiceURL, "/"))
+	payload := map[string]interface{}{
+		"merchant_id": merchantID,
+		"currency":    currency,
+		"amount":      amount,
+		"settlement":  settlementID,
+	}
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(body))
+	if err != nil {
+		log.Printf("settlement: failed to build settle request: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("settlement: failed to call merchant-service settle: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		log.Printf("settlement: merchant-service settle returned %d", resp.StatusCode)
+	}
 }
