@@ -5,26 +5,57 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/kodra-pay/settlement-service/internal/services"
 	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
 )
 
 type SettlementScheduler struct {
-	db              *sql.DB
-	settlementSvc   *services.SettlementService
-	ticker          *time.Ticker
-	stopChan        chan bool
+	db               *sql.DB
+	redis            *redis.Client
+	settlementSvc    *services.SettlementService
+	ticker           *time.Ticker
+	stopChan         chan bool
 	checkIntervalMin int
+	delayMinutes     int
 }
 
 func NewSettlementScheduler(db *sql.DB, settlementSvc *services.SettlementService) *SettlementScheduler {
+	// Initialize Redis client
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis:6379"
+	}
+
+	// Strip redis:// scheme if present
+	if len(redisURL) > 8 && redisURL[:8] == "redis://" {
+		redisURL = redisURL[8:]
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr:     redisURL,
+		Password: "", // no password set
+		DB:       0,  // use default DB
+	})
+
+	// Test connection
+	ctx := context.Background()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Printf("Warning: Failed to connect to Redis at %s: %v", redisURL, err)
+	} else {
+		log.Printf("Settlement scheduler connected to Redis at %s", redisURL)
+	}
+
 	return &SettlementScheduler{
-		db:              db,
-		settlementSvc:   settlementSvc,
-		checkIntervalMin: 15, // Check every 15 minutes
-		stopChan:        make(chan bool),
+		db:               db,
+		redis:            redisClient,
+		settlementSvc:    settlementSvc,
+		checkIntervalMin: 1, // Check every minute for the demo
+		delayMinutes:     5, // T+1 simulated as 5 minutes for demo
+		stopChan:         make(chan bool),
 	}
 }
 
@@ -61,6 +92,25 @@ func (s *SettlementScheduler) processSettlements() {
 	ctx := context.Background()
 	log.Println("Checking for settlements due...")
 
+	// OPTIMIZATION: Check Redis first for merchants with pending transactions
+	var merchantsToCheck []string
+
+	if s.redis != nil {
+		// Get merchants from Redis pending set (only merchants with new transactions)
+		pendingMerchants, err := s.redis.SMembers(ctx, "settlements:merchants:pending").Result()
+		if err != nil {
+			log.Printf("Warning: Failed to get pending merchants from Redis: %v", err)
+			// Fall back to checking all merchants
+			merchantsToCheck = nil
+		} else if len(pendingMerchants) == 0 {
+			log.Println("No merchants with pending transactions in Redis queue. Skipping settlement check.")
+			return
+		} else {
+			merchantsToCheck = pendingMerchants
+			log.Printf("Found %d merchants with pending transactions in Redis", len(pendingMerchants))
+		}
+	}
+
 	// Get current time
 	now := time.Now()
 	currentTime := now.Format("15:04:05")
@@ -69,24 +119,50 @@ func (s *SettlementScheduler) processSettlements() {
 		dayOfWeek = 7 // Sunday = 7
 	}
 
-	// Find merchants with auto-settle enabled whose settlement time has passed
-	query := `
-		SELECT sc.merchant_id, sc.schedule_type, sc.settlement_time, sc.settlement_days,
-		       sc.minimum_amount, sc.settlement_delay_days, sc.currency,
-		       m.name, m.email, m.business_name
-		FROM settlement_configs sc
-		JOIN merchants m ON sc.merchant_id = m.id
-		WHERE sc.auto_settle = true
-		  AND m.status = 'active'
-		  AND m.kyc_status = 'approved'
-		  AND sc.settlement_time <= $1
-		  AND (
-		      sc.schedule_type = 'daily'
-		      OR (sc.schedule_type = 'weekly' AND $2 = ANY(sc.settlement_days))
-		  )
-	`
+	// Build query based on whether we have specific merchants to check
+	var query string
+	var rows *sql.Rows
+	var err error
 
-	rows, err := s.db.QueryContext(ctx, query, currentTime, dayOfWeek)
+	if len(merchantsToCheck) > 0 {
+		// OPTIMIZED: Only check merchants that have pending transactions
+		query = `
+			SELECT sc.merchant_id, sc.schedule_type, sc.settlement_time, sc.settlement_days,
+			       sc.minimum_amount, sc.settlement_delay_days, sc.currency,
+			       m.name, m.email, m.business_name
+			FROM settlement_configs sc
+			JOIN merchants m ON sc.merchant_id = m.id
+			WHERE sc.auto_settle = true
+			  AND m.status = 'active'
+			  AND m.kyc_status = 'approved'
+			  AND sc.settlement_time <= $1
+			  AND sc.merchant_id = ANY($2)
+			  AND (
+			      sc.schedule_type = 'daily'
+			      OR (sc.schedule_type = 'weekly' AND $3 = ANY(sc.settlement_days))
+			  )
+		`
+		rows, err = s.db.QueryContext(ctx, query, currentTime, pq.Array(merchantsToCheck), dayOfWeek)
+	} else {
+		// Fallback: Check all merchants (old behavior)
+		query = `
+			SELECT sc.merchant_id, sc.schedule_type, sc.settlement_time, sc.settlement_days,
+			       sc.minimum_amount, sc.settlement_delay_days, sc.currency,
+			       m.name, m.email, m.business_name
+			FROM settlement_configs sc
+			JOIN merchants m ON sc.merchant_id = m.id
+			WHERE sc.auto_settle = true
+			  AND m.status = 'active'
+			  AND m.kyc_status = 'approved'
+			  AND sc.settlement_time <= $1
+			  AND (
+			      sc.schedule_type = 'daily'
+			      OR (sc.schedule_type = 'weekly' AND $2 = ANY(sc.settlement_days))
+			  )
+		`
+		rows, err = s.db.QueryContext(ctx, query, currentTime, dayOfWeek)
+	}
+
 	if err != nil {
 		log.Printf("Error querying settlement configs: %v", err)
 		return
@@ -125,7 +201,8 @@ func (s *SettlementScheduler) processSettlements() {
 		}
 
 		// Get merchant's available balance (excluding T+N delayed transactions)
-		cutoffDate := now.AddDate(0, 0, -settlementDelayDays)
+		// Use minute-based delay for demo (T+1 simulated as 5 minutes) instead of days.
+		cutoffDate := now.Add(-time.Duration(s.delayMinutes) * time.Minute)
 		balance, err := s.getAvailableBalance(ctx, merchantID, cutoffDate)
 		if err != nil {
 			log.Printf("Error getting balance for merchant %s: %v", merchantID, err)
@@ -155,10 +232,36 @@ func (s *SettlementScheduler) processSettlements() {
 
 		log.Printf("Created settlement %s for merchant %s (%s): %d kobo to %s (%s)",
 			settlementID, businessName, merchantID, balance, bankAccount.AccountName, bankAccount.AccountNumber)
+
+		// Clear Redis pending data for this merchant after successful settlement
+		if s.redis != nil {
+			s.clearMerchantPending(ctx, merchantID)
+		}
+
 		processedCount++
 	}
 
 	log.Printf("Settlement check complete. Processed %d settlements", processedCount)
+}
+
+// clearMerchantPending clears Redis pending settlement data for a merchant
+func (s *SettlementScheduler) clearMerchantPending(ctx context.Context, merchantID string) {
+	pipe := s.redis.Pipeline()
+
+	// Remove from pending set
+	pipe.SRem(ctx, "settlements:merchants:pending", merchantID)
+
+	// Clear amount
+	pipe.Del(ctx, "settlements:amounts:"+merchantID)
+
+	// Clear transaction set
+	pipe.Del(ctx, "settlements:txns:"+merchantID)
+
+	if _, err := pipe.Exec(ctx); err != nil {
+		log.Printf("Warning: Failed to clear Redis data for merchant %s: %v", merchantID, err)
+	} else {
+		log.Printf("Cleared Redis pending data for merchant %s", merchantID)
+	}
 }
 
 type BankAccount struct {
@@ -268,7 +371,7 @@ func (s *SettlementScheduler) createSettlement(
 	var settlementID string
 	err := s.db.QueryRowContext(
 		ctx, query,
-		merchantID, amount, currency, "pending",
+		merchantID, amount, currency, "processing",
 		bankAccount.BankName, bankAccount.AccountNumber, bankAccount.AccountName,
 	).Scan(&settlementID)
 
@@ -293,6 +396,17 @@ func (s *SettlementScheduler) createSettlement(
 
 	if err != nil {
 		return "", fmt.Errorf("failed to create wallet ledger entry: %w", err)
+	}
+
+	// Mark settlement as completed with settled_at timestamp.
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE settlements
+		SET status = 'completed',
+		    settled_at = NOW(),
+		    updated_at = NOW()
+		WHERE id = $1
+	`, settlementID); err != nil {
+		return settlementID, fmt.Errorf("failed to complete settlement %s: %w", settlementID, err)
 	}
 
 	return settlementID, nil
