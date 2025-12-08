@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/kodra-pay/settlement-service/internal/config"
 	"github.com/kodra-pay/settlement-service/internal/handlers"
 	"github.com/kodra-pay/settlement-service/internal/scheduler"
 	"github.com/kodra-pay/settlement-service/internal/services"
@@ -16,6 +17,8 @@ import (
 func Register(app *fiber.App, serviceName string) {
 	health := handlers.NewHealthHandler(serviceName)
 	health.Register(app)
+
+	cfg := config.Load(serviceName, "7008")
 
 	// Get database URL from environment
 	dbURL := os.Getenv("POSTGRES_URL")
@@ -46,7 +49,7 @@ func Register(app *fiber.App, serviceName string) {
 	settlementSvc := services.NewSettlementService()
 
 	// Initialize and start the settlement scheduler
-	settlementScheduler := scheduler.NewSettlementScheduler(db, settlementSvc)
+	settlementScheduler := scheduler.NewSettlementScheduler(db, settlementSvc, cfg.MerchantServiceURL)
 	settlementScheduler.Start()
 
 	log.Println("Settlement scheduler started")
