@@ -402,7 +402,7 @@ func (s *SettlementScheduler) settleMerchantBalance(ctx context.Context, merchan
 	payload := map[string]interface{}{
 		"merchant_id": merchantID,
 		"currency":    currency,
-		"amount":      amount,
+		"amount":      float64(amount) / 100, // send in currency units
 		"settlement":  settlementID,
 	}
 	body, _ := json.Marshal(payload)
