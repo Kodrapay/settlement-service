@@ -252,7 +252,16 @@ func (s *SettlementScheduler) processSettlements() {
 			continue
 		}
 
-		// Check if pending balance meets minimum
+		// Check if pending balance is positive and meets minimum
+		if merchantBalance.PendingBalance <= 0 {
+			log.Printf("Merchant %s (%d) has no pending balance, skipping", businessName, merchantID)
+			// Clear Redis pending data since there's nothing to settle
+			if s.redis != nil {
+				s.clearMerchantPending(ctx, strconv.Itoa(merchantID))
+			}
+			continue
+		}
+
 		if merchantBalance.PendingBalance < minimumAmount {
 			log.Printf("Merchant %s (%d) pending balance %d kobo below minimum %d kobo, skipping",
 				businessName, merchantID, merchantBalance.PendingBalance, minimumAmount)
